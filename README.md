@@ -38,7 +38,7 @@ Sign up at [console.groq.com](https://console.groq.com) — no credit card requi
 ### 2. Install brodex
 
 ```bash
-git clone <repo-url> brodex
+git clone git@github.com:gmaggiotti/brodex
 cd brodex
 pip install -e .
 ```
