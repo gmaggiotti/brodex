@@ -140,29 +140,44 @@ Just describe what you need. No special syntax required!
         ]
         return any(kw in message.lower() for kw in keywords)
 
-    async def handle_special_command(self, message: str) -> bool:
-        """Handle special commands. Return True to exit."""
+    async def handle_special_command(self, message: str) -> str | None:
+        """Handle slash commands. Returns 'exit', 'handled', or None."""
         if message.startswith("/exit"):
-            return True
+            return "exit"
         elif message.startswith("/clear"):
             self.provider.clear_history()
             self.console.print("[dim]✓ Cleared history[/dim]")
-            return False
+            return "handled"
         elif message.startswith("/model"):
             parts = message.split(maxsplit=1)
+            models = self.provider.get_models()
             if len(parts) > 1:
-                model = parts[1]
-                self.provider.model = model
-                self.console.print(f"[dim]Model: {model}[/dim]")
+                choice = parts[1].strip()
+                model = None
+                if choice.isdigit():
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(models):
+                        model = models[idx]
+                elif choice in models:
+                    model = choice
+                if model is None:
+                    self.console.print(f"[red]Unknown model: {choice}[/red]")
+                    self.console.print(f"[dim]Available: {', '.join(models)}[/dim]")
+                else:
+                    self.provider.model = model
+                    self.console.print(f"[dim]Model: {model}[/dim]")
             else:
                 self.console.print(f"[dim]Current model: {self.provider.model}[/dim]")
-                models = self.provider.get_models()
-                self.console.print(f"[dim]Available: {', '.join(models)}[/dim]")
-            return False
+                self.console.print("[dim]Available models:[/dim]")
+                for i, name in enumerate(models, 1):
+                    marker = "•" if name == self.provider.model else " "
+                    self.console.print(f"  [dim]{marker} {i:>2}. {name}[/dim]")
+                self.console.print("[dim]Switch with: /model <name|number>[/dim]")
+            return "handled"
         elif message.startswith("/help"):
             self.show_help()
-            return False
-        return False
+            return "handled"
+        return None
 
     async def process_request(self, user_message: str):
         """Process request using intelligent agent."""
@@ -200,8 +215,11 @@ Just describe what you need. No special syntax required!
                         continue
 
                     # Handle special commands
-                    if await self.handle_special_command(user_input):
+                    result = await self.handle_special_command(user_input)
+                    if result == "exit":
                         break
+                    if result == "handled":
+                        continue
 
                     # Process request
                     await self.process_request(user_input)
