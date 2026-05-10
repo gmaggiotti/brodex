@@ -81,6 +81,63 @@ class GroqProvider:
     def clear_history(self):
         """Clear conversation history."""
         self.messages = []
+        self.last_usage = None
+
+    def rewind(self, n: int = 1) -> int:
+        """
+        Drop the last `n` messages from history. Returns how many were
+        actually removed (clamped to the buffer size).
+        """
+        if n <= 0 or not self.messages:
+            return 0
+        n = min(n, len(self.messages))
+        del self.messages[-n:]
+        return n
+
+    async def compact_history(self) -> str:
+        """
+        Summarize current history into a single compacted user message and
+        replace the buffer. Returns the summary text. The call does not
+        append the request itself to history.
+        """
+        if not self.messages:
+            return ""
+
+        transcript = "\n\n".join(
+            f"[{m.get('role','?')}] {m.get('content','')}"
+            for m in self.messages
+            if m.get("content")
+        )
+        prompt = (
+            "Summarize the conversation below into a compact context block "
+            "(<= 250 words) preserving the user's goals, decisions, file "
+            "paths, and any pending work. Reply with only the summary.\n\n"
+            f"{transcript}"
+        )
+
+        tpm = MODEL_TPM.get(self.model, DEFAULT_TPM)
+        max_output = max(512, min(2048, tpm // 4))
+        input_budget = max(512, tpm - max_output - 256)
+        one_off = self._trim_to_budget(
+            [{"role": "user", "content": prompt}], input_budget
+        )
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=one_off,
+                temperature=0.3,
+                max_tokens=max_output,
+            )
+        except Exception as e:
+            return self._format_error(e, tpm)
+
+        summary = response.choices[0].message.content
+        self._record_usage(getattr(response, "usage", None))
+        self.messages = [
+            {"role": "user", "content": f"[Compacted prior context]\n{summary}"}
+        ]
+        return summary
 
     def get_models(self):
         """List available models."""
