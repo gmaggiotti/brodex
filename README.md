@@ -40,7 +40,7 @@ Requires Python 3.9+ and a free Groq API key from
 [console.groq.com](https://console.groq.com).
 
 ```bash
-git clone https://github.com/<you>/brodex.git
+git clone https://github.com/gmaggiotti/brodex.git
 cd brodex
 pip install -e .
 export GROQ_API_KEY=...   # add to your shell profile to persist
