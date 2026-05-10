@@ -66,14 +66,16 @@ class IntelligentAgent:
                 pass
             return
 
-        status = self.console.status(f"[cyan]{label}… 0.0s[/cyan]", spinner="dots")
+        status = self.console.status(
+            f"[dim]{label}… 0.0s[/dim]", spinner="dots", spinner_style="dim"
+        )
         status.__enter__()
         stop = asyncio.Event()
 
         async def tick():
             while not stop.is_set():
                 with contextlib.suppress(Exception):
-                    status.update(f"[cyan]{label}… {elapsed():.1f}s[/cyan]")
+                    status.update(f"[dim]{label}… {elapsed():.1f}s[/dim]")
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=0.1)
                 except asyncio.TimeoutError:
@@ -131,7 +133,7 @@ class IntelligentAgent:
             action = self._extract_tool_call(llm_response)
             if action is None:
                 self._print("\n[bold green]󰌞 Response[/bold green]")
-                self._print(llm_response)
+                self._print(self._render_response(llm_response))
                 self.last_context = "\n\n".join(transcript_for_context)
                 return llm_response
 
@@ -195,6 +197,16 @@ class IntelligentAgent:
             new_line = new_preview[0][:80] if new_preview else ""
             return f"{head}\n[red]- {old_line}[/red]\n[green]+ {new_line}[/green]"
         return f"\n[bold yellow]{tool.upper()}[/bold yellow] {params}"
+
+    @staticmethod
+    def _render_response(text: str) -> str:
+        """Dim reasoning-model `<think>…</think>` blocks so they recede vs. the answer."""
+        from rich.markup import escape
+
+        def wrap(m: re.Match) -> str:
+            return f"[dim]<think>{escape(m.group(1))}</think>[/dim]"
+
+        return re.sub(r"<think>([\s\S]*?)</think>", wrap, text)
 
     @staticmethod
     def _summarize_params(params: dict) -> str:
