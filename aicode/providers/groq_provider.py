@@ -32,6 +32,8 @@ class GroqProvider:
         self.client = Groq(api_key=api_key)
         self.model = "qwen/qwen3-32b"
         self.messages = []
+        self.last_usage = None
+        self.total_tokens_used = 0
 
     async def send_message(self, message: str) -> str:
         """Send message to Groq and get response."""
@@ -52,12 +54,29 @@ class GroqProvider:
                 max_tokens=max_output,
             )
             assistant_message = response.choices[0].message.content
+            self._record_usage(getattr(response, "usage", None))
             self.messages.append({"role": "assistant", "content": assistant_message})
             # Persist trimming so future calls don't re-blow the same budget.
             self.messages = self._trim_to_budget(self.messages, input_budget)
             return assistant_message
         except Exception as e:
+            self.last_usage = None
             return self._format_error(e, tpm)
+
+    def _record_usage(self, usage) -> None:
+        """Capture token usage from the API response, if available."""
+        if usage is None:
+            self.last_usage = None
+            return
+        prompt = getattr(usage, "prompt_tokens", 0) or 0
+        completion = getattr(usage, "completion_tokens", 0) or 0
+        total = getattr(usage, "total_tokens", prompt + completion) or 0
+        self.last_usage = {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+        }
+        self.total_tokens_used += total
 
     def clear_history(self):
         """Clear conversation history."""

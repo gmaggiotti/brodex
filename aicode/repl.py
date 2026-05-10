@@ -131,15 +131,6 @@ Just describe what you need. No special syntax required!
 """
         self.console.print(Markdown(help_text))
 
-    def _is_code_request(self, message: str) -> bool:
-        """Detect if user is asking to write/fix code."""
-        keywords = [
-            "write", "create", "fix", "implement", "build", "generate",
-            "add", "refactor", "optimize", "improve", "debug", "patch",
-            "modify", "change", "update", "convert", "rewrite", "code"
-        ]
-        return any(kw in message.lower() for kw in keywords)
-
     async def handle_special_command(self, message: str) -> str | None:
         """Handle slash commands. Returns 'exit', 'handled', or None."""
         if message.startswith("/exit"):
@@ -180,21 +171,9 @@ Just describe what you need. No special syntax required!
         return None
 
     async def process_request(self, user_message: str):
-        """Process request using intelligent agent."""
-        is_code_request = self._is_code_request(user_message)
-
-        # Process request - agent will show all progress
-        if is_code_request:
-            summary, response = await self.agent.apply_code_changes(user_message)
-        else:
-            summary, response = await self.agent.understand_request_and_help(user_message)
-
-        # Show final response for analysis
-        if not is_code_request and response and response != "Cancelled":
-            self.console.print("\n[bold green]󰌞 Response[/bold green]")
-            self.console.print(response)
-
-        return summary, response
+        """Process request using the agentic tool-call loop."""
+        response = await self.agent.agentic_loop(user_message)
+        return response, response
 
     async def run(self):
         """Run the REPL loop."""

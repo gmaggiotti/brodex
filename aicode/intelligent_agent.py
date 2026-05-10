@@ -1,497 +1,246 @@
 import asyncio
 import contextlib
-import subprocess
 import json
 import re
-import difflib
-from pathlib import Path
-from aicode.tools.code_tools import execute_command, edit_file
-from aicode.tools import read_file, search_web, fetch_url
+import time
+
+from aicode.tools_registry import TOOLS, describe_tools, run_tool
+
+
+SYSTEM_PROMPT = """You are an autonomous coding assistant running an agentic tool-call loop.
+
+Each turn you have two options:
+(a) Call exactly one tool by replying with a single JSON object and nothing else:
+    {{"thought": "<one-sentence plan for this step>", "tool": "<tool name>", "params": {{...}}}}
+(b) Stop and answer the user. Reply in plain prose (no JSON). The loop ends when
+    your reply is not a tool-call JSON object.
+
+Available tools:
+{tools}
+
+Guidelines:
+- Read-only tools (read_file, execute_command for ls/grep/find/git, search_web, fetch_url)
+  run immediately — use them freely to gather context.
+- Filesystem-modifying tools (edit_file, create_file) prompt the user for confirmation.
+  If the user denies, try a different approach or stop and explain.
+- Use `execute_command` only for read-only/discovery commands. Never use it to modify
+  files — use `edit_file` or `create_file` so the user can review and approve.
+- When you have enough information, stop calling tools and reply with the final answer.
+- Always emit valid JSON when calling a tool. Do not wrap it in code fences.
+"""
 
 
 class IntelligentAgent:
-    """Agent that uses LLM to decide what to explore and fetch."""
+    """Agent that runs an LLM-driven tool-call loop until the LLM stops calling tools."""
+
+    MAX_ITERATIONS = 15
+    TOOL_RESULT_TRUNCATE = 1500
 
     def __init__(self, groq_provider, console=None):
         self.groq = groq_provider
-        self.last_context = ""
         self.console = console
+        self.last_context = ""
 
     def _print(self, text: str = ""):
-        """Print with optional console object."""
         if self.console:
             self.console.print(text)
         else:
             print(text)
 
-    def _thinking(self, message: str = "Thinking"):
-        """Rolling spinner shown while the LLM is working."""
-        if self.console:
-            return self.console.status(
-                f"[cyan]{message}…[/cyan]", spinner="dots"
-            )
-        return contextlib.nullcontext()
+    @contextlib.asynccontextmanager
+    async def _timer(self, label: str):
+        """
+        Live elapsed-time spinner. Yields a callable that returns elapsed
+        seconds; read it after the block to record the final duration.
+        """
+        start = time.monotonic()
 
-    async def ask_permission(self, what: str, details: str = "") -> bool:
-        """Ask user for permission (interactive)."""
+        def elapsed() -> float:
+            return time.monotonic() - start
+
+        if not self.console:
+            print(f"{label}…", flush=True)
+            try:
+                yield elapsed
+            finally:
+                pass
+            return
+
+        status = self.console.status(f"[cyan]{label}… 0.0s[/cyan]", spinner="dots")
+        status.__enter__()
+        stop = asyncio.Event()
+
+        async def tick():
+            while not stop.is_set():
+                with contextlib.suppress(Exception):
+                    status.update(f"[cyan]{label}… {elapsed():.1f}s[/cyan]")
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+
+        task = asyncio.create_task(tick())
+        try:
+            yield elapsed
+        finally:
+            stop.set()
+            with contextlib.suppress(Exception):
+                await task
+            with contextlib.suppress(Exception):
+                status.__exit__(None, None, None)
+
+    def _format_usage(self) -> str:
+        """Format the most recent LLM usage as a short suffix string."""
+        usage = getattr(self.groq, "last_usage", None)
+        if not usage:
+            return ""
+        return (
+            f" · {usage['total_tokens']} tok "
+            f"(in {usage['prompt_tokens']}, out {usage['completion_tokens']})"
+        )
+
+    async def ask_permission(self, what: str) -> bool:
+        """Explicit y/n prompt. Default is NO — only an affirmative `y` proceeds."""
         if self.console:
             from rich.prompt import Confirm
-            confirm = Confirm.ask(f"[yellow]{what}?[/yellow]", default=True)
-            return confirm
-        else:
-            response = input(f"\n{what}? (y/n) [y]: ").lower().strip()
-            return response != "n"
 
-    async def process_user_request(self, user_message: str) -> tuple[str, str]:
-        """
-        Process user request with full transparency and web integration.
-        """
+            return Confirm.ask(f"[yellow]{what}?[/yellow]", default=False)
+        response = input(f"\n{what}? (y/N): ").strip().lower()
+        return response in ("y", "yes")
 
-        self._print("\n[bold cyan]󰬁 Understanding your request[/bold cyan]")
-        self._print(f"[dim]{user_message}[/dim]\n")
+    async def agentic_loop(self, user_message: str) -> str:
+        """Run the tool-call loop. Returns the final assistant message."""
+        self._print(f"\n[bold cyan]󰬁 {user_message}[/bold cyan]\n")
 
-        # Ask LLM what information it needs
-        self._print("[bold cyan]󰍉 Planning exploration[/bold cyan]")
+        first_prompt = (
+            SYSTEM_PROMPT.format(tools=describe_tools())
+            + f"\n\nUser request: {user_message}\n\n"
+            "Reply with one tool-call JSON object, or with your final answer in prose."
+        )
 
-        context_request = f"""User is asking: "{user_message}"
+        transcript_for_context = []
+        next_message = first_prompt
 
-You are a helpful coding assistant. Analyze what the user needs and gather context.
+        for step in range(1, self.MAX_ITERATIONS + 1):
+            async with self._timer(f"Thinking (step {step})") as elapsed:
+                llm_response = await self.groq.send_message(next_message)
+            self._print(
+                f"[dim]󰔚 step {step}: {elapsed():.1f}s{self._format_usage()}[/dim]"
+            )
 
-What resources do you need? Respond ONLY with JSON in this shape:
-{{
-    "commands": [<shell commands to discover files, e.g. "ls", "find . -name '*.py'">],
-    "files_to_read": [<actual paths discovered or referenced by the user — leave empty if you don't yet know which files exist>],
-    "web_searches": [<search queries, only if external info is needed>],
-    "web_fetches": [<URLs to fetch, only if needed>],
-    "explanation": "<one sentence on what you're investigating>"
-}}
+            action = self._extract_tool_call(llm_response)
+            if action is None:
+                self._print("\n[bold green]󰌞 Response[/bold green]")
+                self._print(llm_response)
+                self.last_context = "\n\n".join(transcript_for_context)
+                return llm_response
 
-Rules:
-- Do NOT include placeholder filenames like main.py or app.py unless the user named them.
-- Prefer running a discovery command first; only list files_to_read once you know they exist.
-- Return ONLY valid JSON, no prose.
-"""
+            tool = action.get("tool")
+            params = action.get("params") or {}
+            thought = action.get("thought", "")
 
-        with self._thinking("Planning exploration"):
-            llm_context_request = await self.groq.send_message(context_request)
-        context_data = self._extract_json(llm_context_request)
+            if thought:
+                self._print(f"[dim]󰋗 {thought}[/dim]")
 
-        if not context_data:
-            context_data = {
-                "commands": ["find . -type f \\( -name '*.py' -o -name '*.js' \\) | head -20"],
-                "files_to_read": [],
-                "web_searches": [],
-                "web_fetches": [],
-                "explanation": "Exploring codebase",
-            }
-
-        # Show plan and ask permission
-        self._print("[bold yellow]󰋗 Exploration plan[/bold yellow]")
-        self._print(f"[dim]{context_data.get('explanation', '')}[/dim]\n")
-
-        if context_data.get("commands"):
-            self._print("[dim]Codebase exploration:[/dim]")
-            for cmd in context_data.get("commands", [])[:5]:
-                self._print(f"  [dim]$[/dim] {cmd}")
-
-        if context_data.get("files_to_read"):
-            self._print("[dim]Files to read:[/dim]")
-            for f in context_data.get("files_to_read", [])[:5]:
-                self._print(f"  [dim]󰈙[/dim] {f}")
-
-        if context_data.get("web_searches"):
-            self._print("[dim]Web searches:[/dim]")
-            for s in context_data.get("web_searches", [])[:3]:
-                self._print(f"  [dim]󰎔[/dim] {s}")
-
-        if context_data.get("web_fetches"):
-            self._print("[dim]Fetch from web:[/dim]")
-            for url in context_data.get("web_fetches", [])[:3]:
-                self._print(f"  [dim]󰌐[/dim] {url}")
-
-        # Read-only exploration runs without asking — only writes need permission.
-        self._print("\n[bold cyan]󰃐 Gathering context[/bold cyan]\n")
-
-        gathered_context = []
-        gathered_context.append(f"**Request:** {user_message}\n")
-        gathered_context.append(f"**Plan:** {context_data.get('explanation', '')}\n")
-        gathered_context.append("---\n")
-
-        # Execute commands
-        for cmd in context_data.get("commands", [])[:5]:
-            self._print(f"[dim]$ {cmd}[/dim]")
-            try:
-                output = await execute_command(cmd)
-                if output and output != "(no output)":
-                    gathered_context.append(f"\n**Command:** `{cmd}`\n```\n{output[:500]}\n```")
-                    self._print(f"[green]✓[/green]")
-            except Exception as e:
-                self._print(f"[red]✗[/red]")
-
-        # Read files — skip ones that don't exist instead of surfacing the error
-        for file in context_data.get("files_to_read", [])[:5]:
-            if not Path(file).is_file():
+            meta = TOOLS.get(tool)
+            if meta is None:
+                msg = (
+                    f"Tool '{tool}' is not available. "
+                    f"Choose one of: {list(TOOLS.keys())}."
+                )
+                self._print(f"[red]✗ {msg}[/red]")
+                next_message = msg
                 continue
-            self._print(f"[dim]󰈙 {file}[/dim]")
-            content = read_file(file)
-            if content and "Error" not in content:
-                gathered_context.append(f"\n**File:** `{file}`\n{content}")
-                self._print(f"[green]✓[/green]")
-            else:
-                self._print(f"[red]✗[/red]")
 
-        # Web searches
-        for query in context_data.get("web_searches", [])[:3]:
-            self._print(f"[dim]󰎔 Searching: {query}[/dim]")
-            try:
-                results = await search_web(query)
-                if results and "No search results" not in results:
-                    gathered_context.append(f"\n**Web search:** `{query}`\n{results}")
-                    self._print(f"[green]✓[/green]")
-            except:
-                self._print(f"[red]✗[/red]")
+            if meta["modifies_fs"]:
+                self._print(self._preview_fs_change(tool, params))
+                approved = await self.ask_permission(f"Apply {tool}")
+                if not approved:
+                    self._print("[dim]✗ Denied[/dim]")
+                    next_message = (
+                        f"User denied {tool}. Try a different approach, "
+                        "or stop and explain."
+                    )
+                    continue
 
-        # Fetch URLs
-        for url in context_data.get("web_fetches", [])[:3]:
-            self._print(f"[dim]󰌐 Fetching: {url}[/dim]")
-            try:
-                content = await fetch_url(url)
-                if content and "Error" not in content:
-                    gathered_context.append(f"\n**From web:** {content}")
-                    self._print(f"[green]✓[/green]")
-            except:
-                self._print(f"[red]✗[/red]")
+            self._print(f"[dim]→ {tool}({self._summarize_params(params)})[/dim]")
+            async with self._timer(f"Running {tool}") as tool_elapsed:
+                result = await run_tool(tool, params)
+            truncated = self._truncate(result)
+            self._print(f"[green]✓[/green] [dim]({tool_elapsed():.1f}s)[/dim]")
 
-        context_str = "\n".join(gathered_context)
-        self.last_context = context_str
+            transcript_for_context.append(f"{tool}({params}) -> {truncated}")
+            next_message = (
+                f"Tool `{tool}` returned:\n{truncated}\n\n"
+                "Reply with the next tool-call JSON, or your final answer in prose."
+            )
 
-        # Get AI response
-        self._print("\n[bold cyan]󰌞 Asking AI[/bold cyan]")
+        self._print("[yellow]⚠ Max iterations reached without a final answer[/yellow]")
+        self.last_context = "\n\n".join(transcript_for_context)
+        return "Stopped after max iterations."
 
-        full_request = f"""{user_message}
+    def _preview_fs_change(self, tool: str, params: dict) -> str:
+        if tool == "create_file":
+            content = params.get("content", "") or ""
+            n_lines = len(content.splitlines())
+            return (
+                f"\n[bold yellow]CREATE[/bold yellow] `{params.get('path')}` "
+                f"[dim]({n_lines} lines, {len(content)} chars)[/dim]"
+            )
+        if tool == "edit_file":
+            old_preview = (params.get("old_text", "") or "").strip().splitlines()
+            new_preview = (params.get("new_text", "") or "").strip().splitlines()
+            head = f"\n[bold yellow]EDIT[/bold yellow] `{params.get('path')}`"
+            old_line = old_preview[0][:80] if old_preview else ""
+            new_line = new_preview[0][:80] if new_preview else ""
+            return f"{head}\n[red]- {old_line}[/red]\n[green]+ {new_line}[/green]"
+        return f"\n[bold yellow]{tool.upper()}[/bold yellow] {params}"
 
----
-## Context
-{context_str}
+    @staticmethod
+    def _summarize_params(params: dict) -> str:
+        parts = []
+        for k, v in (params or {}).items():
+            s = str(v).replace("\n", " ")
+            if len(s) > 60:
+                s = s[:60] + "…"
+            parts.append(f"{k}={s!r}")
+        return ", ".join(parts)
 
----
-Based on this context, please help."""
+    @classmethod
+    def _truncate(cls, text: str) -> str:
+        if not text:
+            return ""
+        if len(text) <= cls.TOOL_RESULT_TRUNCATE:
+            return text
+        return text[: cls.TOOL_RESULT_TRUNCATE] + "…"
 
-        with self._thinking("Thinking"):
-            ai_response = await self.groq.send_message(full_request)
-
-        return context_str, ai_response
-
-    def _extract_json(self, text: str) -> dict:
-        """Extract JSON from response."""
+    def _extract_tool_call(self, text: str) -> dict | None:
+        """Return a dict if `text` parses as a tool-call JSON object, else None."""
         if not text:
             return None
+        candidates = [text.strip()]
+        fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+        if fence:
+            candidates.append(fence.group(1).strip())
+        obj = re.search(r"\{[\s\S]*\}", text)
+        if obj:
+            candidates.append(obj.group())
 
-        try:
-            # Try to parse the whole response as JSON first
-            return json.loads(text)
-        except:
-            pass
-
-        try:
-            # Look for JSON object in the text
-            match = re.search(r"\{[\s\S]*\}", text)
-            if match:
-                json_str = match.group()
-                return json.loads(json_str)
-        except:
-            pass
-
-        try:
-            # Try to find JSON between triple backticks
-            match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-            if match:
-                json_str = match.group(1).strip()
-                return json.loads(json_str)
-        except:
-            pass
-
+        for cand in candidates:
+            try:
+                parsed = json.loads(cand)
+            except Exception:
+                continue
+            if isinstance(parsed, dict) and "tool" in parsed:
+                return parsed
         return None
 
     async def understand_request_and_help(self, message: str) -> tuple[str, str]:
-        """Main entry point for analysis requests."""
-        return await self.process_user_request(message)
+        """Backward-compatible entry point — runs the agentic loop."""
+        response = await self.agentic_loop(message)
+        return self.last_context, response
 
-    async def apply_code_changes(self, user_message: str) -> tuple[str, str]:
-        """Apply code changes with full permission workflow."""
-
-        self._print("\n[bold cyan]󰘧 Code modification[/bold cyan]")
-        self._print(f"[dim]{user_message}[/dim]\n")
-
-        # Step 1: Plan what to read
-        self._print("[bold cyan]󰍉 Planning analysis[/bold cyan]")
-
-        understand_request = f"""User wants to: "{user_message}"
-
-You are a code assistant. Plan what to read from their codebase.
-Respond with ONLY this JSON structure (no other text):
-{{
-    "commands": [<shell commands to discover relevant files>],
-    "files_to_read": [<actual paths the user named or that you've already discovered — leave empty otherwise>],
-    "web_searches": [<queries, only if external info is needed>],
-    "web_fetches": [],
-    "explanation": "<one sentence on what you're investigating>"
-}}
-
-Rules:
-- Do NOT invent placeholder filenames like main.py or app.py — only list files you know exist.
-- Prefer a discovery command first; populate files_to_read only with real paths."""
-
-        with self._thinking("Planning analysis"):
-            llm_context_req = await self.groq.send_message(understand_request)
-        context_data = self._extract_json(llm_context_req)
-
-        if not context_data:
-            self._print("[yellow]⚠ Could not parse analysis, using defaults[/yellow]")
-
-        if not context_data:
-            context_data = {
-                "commands": ["find . -type f \\( -name '*.py' -o -name '*.js' \\) | head -20"],
-                "files_to_read": [],
-                "web_searches": [],
-                "web_fetches": [],
-                "explanation": "Exploring codebase",
-            }
-
-        # Show plan
-        self._print(f"[dim]{context_data.get('explanation', '')}[/dim]\n")
-
-        existing_files = [
-            f for f in context_data.get("files_to_read", [])[:5]
-            if Path(f).is_file()
-        ]
-        if existing_files:
-            self._print("[dim]Will read:[/dim]")
-            for f in existing_files:
-                self._print(f"  [dim]󰈙[/dim] {f}")
-
-        # Read-only analysis runs without asking — only the apply step prompts.
-        self._print("\n[bold cyan]󰃐 Analyzing[/bold cyan]\n")
-
-        gathered = []
-
-        for cmd in context_data.get("commands", [])[:3]:
-            self._print(f"[dim]$ {cmd}[/dim]")
-            try:
-                output = await execute_command(cmd)
-                if output:
-                    gathered.append(f"```\n{cmd}\n{output[:300]}\n```")
-                    self._print(f"[green]✓[/green]")
-            except:
-                self._print(f"[red]✗[/red]")
-
-        for file in existing_files:
-            self._print(f"[dim]󰈙 {file}[/dim]")
-            content = read_file(file)
-            if content and "Error" not in content:
-                gathered.append(f"**File:** `{file}`\n{content}")
-                self._print(f"[green]✓[/green]")
-            else:
-                self._print(f"[red]✗[/red]")
-
-        for query in context_data.get("web_searches", [])[:2]:
-            self._print(f"[dim]󰎔 {query}[/dim]")
-            try:
-                results = await search_web(query)
-                if results:
-                    gathered.append(f"**Search:** {query}\n{results}")
-                    self._print(f"[green]✓[/green]")
-            except:
-                self._print(f"[red]✗[/red]")
-
-        context_str = "\n".join(gathered)
-
-        # Step 2: Generate code changes
-        self._print("\n[bold cyan]󰌞 Generating code[/bold cyan]")
-
-        code_prompt = f"""User wants: {user_message}
-
-Context:
-{context_str}
-
----
-
-Generate code changes. Respond with ONLY this JSON (no explanations):
-{{
-    "changes": [
-        {{
-            "action": "create",
-            "file": "new_file.py",
-            "content": "file content here"
-        }},
-        {{
-            "action": "edit",
-            "file": "existing.py",
-            "old_text": "original code",
-            "new_text": "new code"
-        }}
-    ],
-    "explanation": "Brief explanation",
-    "next_steps": "What to do next"
-}}
-
-Important:
-- Return ONLY the JSON object, nothing else
-- For edits, old_text must be EXACT match
-- Preserve all whitespace and formatting
-- For creates, include complete file content"""
-
-        with self._thinking("Generating code"):
-            llm_response = await self.groq.send_message(code_prompt)
-        changes_data = self._extract_json(llm_response)
-
-        if not changes_data or "changes" not in changes_data:
-            self._print("[red]✗ Could not generate code[/red]")
-            self._print(f"[dim]Response: {llm_response[:300]}[/dim]")
-
-            # Try to extract any actionable text from the response
-            if "Error" in llm_response or "error" in llm_response:
-                self._print("[yellow]The AI encountered an error. Try:[/yellow]")
-                self._print("[dim]  • Make sure your API key is valid[/dim]")
-                self._print("[dim]  • Check your internet connection[/dim]")
-                self._print("[dim]  • Try a simpler request[/dim]")
-
-            return context_str, llm_response
-
-        # Show planned changes
-        self._print("\n[bold yellow]󰋗 Planned changes[/bold yellow]\n")
-
-        for i, change in enumerate(changes_data.get("changes", []), 1):
-            action = change.get("action")
-            file_path = change.get("file")
-
-            if action == "create":
-                content = change.get("content", "")
-                self._print(f"[cyan]{i}.[/cyan] [bold]CREATE[/bold] `{file_path}`")
-                self._print("[dim]--- New file ---[/dim]")
-
-                # Show code in diff format
-                for line_num, line in enumerate(content.splitlines(), 1):
-                    # Show line numbers and code with + prefix
-                    line_str = f"{line_num:4d} | {line}"
-                    self._print(f"[green]+ {line_str}[/green]")
-
-                if len(content.splitlines()) > 20:
-                    self._print(f"[dim]... ({len(content.splitlines())} lines total)[/dim]")
-                self._print()
-
-            elif action == "edit":
-                old_text = change.get("old_text", "")
-                new_text = change.get("new_text", "")
-                self._print(f"[cyan]{i}.[/cyan] [bold]EDIT[/bold] `{file_path}`")
-                self._print("[dim]--- Diff ---[/dim]")
-
-                # Show diff
-                old_lines = old_text.splitlines(keepends=True)
-                new_lines = new_text.splitlines(keepends=True)
-
-                # Ensure we have lines to diff
-                if not old_lines:
-                    old_lines = [old_text] if old_text else [""]
-                if not new_lines:
-                    new_lines = [new_text] if new_text else [""]
-
-                diff = list(difflib.unified_diff(
-                    old_lines, new_lines,
-                    lineterm=""
-                ))
-
-                if diff and len(diff) > 2:
-                    for line in diff[2:]:  # Skip file headers
-                        if line.startswith("+") and not line.startswith("+++"):
-                            self._print(f"[green]{line.rstrip()}[/green]")
-                        elif line.startswith("-") and not line.startswith("---"):
-                            self._print(f"[red]{line.rstrip()}[/red]")
-                        else:
-                            self._print(f"[dim]{line.rstrip()}[/dim]")
-                else:
-                    # Fallback display for simple changes
-                    self._print(f"[red]- {old_text[:80].strip()}[/red]")
-                    self._print(f"[green]+ {new_text[:80].strip()}[/green]")
-
-                self._print()
-
-        self._print(f"\n[dim]{changes_data.get('explanation', '')}[/dim]\n")
-
-        # Ask to apply
-        apply = await self.ask_permission("[yellow]󰄬 Apply changes[/yellow]")
-        if not apply:
-            self._print("[dim]✗ Cancelled[/dim]")
-            return "", "Changes cancelled"
-
-        # Apply changes
-        self._print("\n[bold cyan]󰝤 Applying[/bold cyan]\n")
-
-        applied = []
-
-        for change in changes_data.get("changes", []):
-            action = change.get("action")
-            file_path = change.get("file")
-
-            if action == "create":
-                content = change.get("content", "")
-                try:
-                    path = Path(file_path)
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(content)
-                    self._print(f"[green]✓[/green] Created `{file_path}`")
-                    self._print(f"[dim]{len(content)} chars[/dim]\n")
-                    applied.append(f"✓ Created `{file_path}`")
-                except Exception as e:
-                    self._print(f"[red]✗[/red] Failed: {e}")
-                    applied.append(f"✗ Failed to create `{file_path}`")
-
-            elif action == "edit":
-                old_text = change.get("old_text", "")
-                new_text = change.get("new_text", "")
-                try:
-                    # Show diff
-                    old_lines = old_text.splitlines(keepends=True)
-                    new_lines = new_text.splitlines(keepends=True)
-                    diff = list(difflib.unified_diff(
-                        old_lines, new_lines,
-                        fromfile=f"{file_path} (old)",
-                        tofile=f"{file_path} (new)",
-                        lineterm=""
-                    ))
-
-                    if diff:
-                        self._print(f"[green]✓[/green] Editing `{file_path}`")
-                        self._print("[dim]--- Diff ---[/dim]")
-                        for line in diff[2:]:  # Skip the file headers
-                            if line.startswith("+"):
-                                self._print(f"[green]{line.rstrip()}[/green]")
-                            elif line.startswith("-"):
-                                self._print(f"[red]{line.rstrip()}[/red]")
-                            else:
-                                self._print(f"[dim]{line.rstrip()}[/dim]")
-                        self._print()
-
-                    # Apply the change
-                    result = await edit_file(file_path, old_text, new_text)
-                    applied.append(f"✓ Edited `{file_path}`")
-                except Exception as e:
-                    self._print(f"[red]✗[/red] Failed: {e}")
-                    applied.append(f"✗ Failed to edit `{file_path}`")
-
-        # Summary
-        self._print("\n[bold cyan]󰺏 Summary[/bold cyan]")
-        self._print(f"\n[dim]{changes_data.get('explanation', '')}[/dim]")
-        self._print(f"\n[dim]Next: {changes_data.get('next_steps', '')}[/dim]")
-
-        summary = f"""## Changes Applied
-
-{chr(10).join(applied)}
-
-## What Changed
-{changes_data.get('explanation', '')}
-
-## Next Steps
-{changes_data.get('next_steps', '')}"""
-
-        return summary, summary
+    async def apply_code_changes(self, message: str) -> tuple[str, str]:
+        """Backward-compatible entry point — runs the agentic loop."""
+        response = await self.agentic_loop(message)
+        return self.last_context, response
