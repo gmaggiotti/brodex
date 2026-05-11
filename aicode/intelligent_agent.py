@@ -3,6 +3,7 @@ import contextlib
 import json
 import re
 import time
+from pathlib import Path
 
 from aicode.tools_registry import TOOLS, describe_tools, run_tool
 
@@ -182,21 +183,54 @@ class IntelligentAgent:
         return "Stopped after max iterations."
 
     def _preview_fs_change(self, tool: str, params: dict) -> str:
+        path = params.get("path") or ""
         if tool == "create_file":
-            content = params.get("content", "") or ""
-            n_lines = len(content.splitlines())
-            return (
-                f"\n[bold yellow]CREATE[/bold yellow] `{params.get('path')}` "
-                f"[dim]({n_lines} lines, {len(content)} chars)[/dim]"
-            )
+            new_content = params.get("content", "") or ""
+            existing = ""
+            label = "CREATE"
+            try:
+                p = Path(path).expanduser()
+                if p.exists():
+                    existing = p.read_text()
+                    label = "OVERWRITE"
+            except (OSError, UnicodeDecodeError):
+                label = "OVERWRITE"
+            head = f"\n[bold yellow]{label}[/bold yellow] `{path}`"
+            body = self._render_edit_diff(existing, new_content)
+            return f"{head}\n{body}"
         if tool == "edit_file":
-            old_preview = (params.get("old_text", "") or "").strip().splitlines()
-            new_preview = (params.get("new_text", "") or "").strip().splitlines()
-            head = f"\n[bold yellow]EDIT[/bold yellow] `{params.get('path')}`"
-            old_line = old_preview[0][:80] if old_preview else ""
-            new_line = new_preview[0][:80] if new_preview else ""
-            return f"{head}\n[red]- {old_line}[/red]\n[green]+ {new_line}[/green]"
+            head = f"\n[bold yellow]EDIT[/bold yellow] `{path}`"
+            body = self._render_edit_diff(
+                params.get("old_text", "") or "",
+                params.get("new_text", "") or "",
+            )
+            return f"{head}\n{body}"
         return f"\n[bold yellow]{tool.upper()}[/bold yellow] {params}"
+
+    @staticmethod
+    def _render_edit_diff(old: str, new: str) -> str:
+        """Render a full line-diff: `-` light red for removals, `+` light green for additions."""
+        import difflib
+
+        from rich.markup import escape
+
+        old_lines = old.splitlines()
+        new_lines = new.splitlines()
+
+        sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+        rendered = []
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                for line in old_lines[i1:i2]:
+                    rendered.append(f"[dim]  {escape(line)}[/dim]")
+                continue
+            if tag in ("delete", "replace"):
+                for line in old_lines[i1:i2]:
+                    rendered.append(f"[bright_red]- {escape(line)}[/bright_red]")
+            if tag in ("insert", "replace"):
+                for line in new_lines[j1:j2]:
+                    rendered.append(f"[bright_green]+ {escape(line)}[/bright_green]")
+        return "\n".join(rendered)
 
     @staticmethod
     def _render_response(text: str) -> str:

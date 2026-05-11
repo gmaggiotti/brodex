@@ -328,10 +328,7 @@ Just describe what you need. No special syntax required!
                     await self.process_request(user_input)
                     self.console.print()
 
-                except KeyboardInterrupt:
-                    self.console.print()
-                    continue
-                except EOFError:
+                except (KeyboardInterrupt, EOFError):
                     break
         finally:
             self.console.print("\n[dim]Goodbye![/dim]")
