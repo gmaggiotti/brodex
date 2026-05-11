@@ -33,6 +33,11 @@ Apply edit_file? [y/N]: y
   with **no** as the default.
 * **Live feedback.** Every thinking step shows a ticking elapsed-seconds
   timer plus the token usage Groq returned for that call.
+* **Long-running sessions.** `/compact` summarizes the running transcript
+  into a single context block when you're brushing the context window,
+  and `/rewind` undoes the last turn(s) when the agent goes off the rails.
+* **MCP-ready.** Register Model Context Protocol servers with `/mcp add`;
+  the catalogue persists to `~/.brodex/mcp.json`.
 
 ## Install
 
@@ -63,14 +68,44 @@ with prose instead of another tool call.
 
 ## REPL commands
 
-| Command  | Effect                                |
-| -------- | ------------------------------------- |
-| `/help`  | Show in-app help.                     |
-| `/clear` | Clear the conversation history.       |
-| `/model` | Show or switch the active Groq model. |
-| `/exit`  | Quit brodex.                          |
+| Command                                | Effect                                                      |
+| -------------------------------------- | ----------------------------------------------------------- |
+| `/help`                                | Show in-app help.                                           |
+| `/clear`                               | Clear the conversation history.                             |
+| `/compact`                             | Summarize history into a single compacted context block.    |
+| `/rewind [n]`                          | Undo the last `n` user turns (default 1).                   |
+| `/mcp`                                 | List configured MCP servers.                                |
+| `/mcp add <name> <command> [args...]`  | Register an MCP server.                                     |
+| `/mcp remove <name>`                   | Drop an MCP server.                                         |
+| `/model [name\|number]`                | Show or switch the active Groq model.                       |
+| `/exit`                                | Quit brodex.                                                |
 
-Anything else you type is sent to the agent.
+Anything else you type is sent to the agent. Slash commands tab-complete
+as you type.
+
+### `/compact`
+
+When the conversation grows long, `/compact` asks the active model to
+fold the running transcript into a single ≤250-word context block that
+preserves goals, decisions, file paths, and pending work. The buffer is
+replaced in place, so the next turn starts fresh but informed.
+
+### `/rewind`
+
+`/rewind` pops history snapshots taken before each user turn. `/rewind 3`
+walks back three turns. Useful when the agent has gone down a wrong path
+and you'd rather not `/clear` and start over.
+
+### `/mcp`
+
+`/mcp` manages the on-disk catalogue of [Model Context Protocol](https://modelcontextprotocol.io)
+servers at `~/.brodex/mcp.json`.
+
+```bash
+/mcp add fs npx -y @modelcontextprotocol/server-filesystem /tmp
+/mcp                  # list
+/mcp remove fs        # drop
+```
 
 ## Configuration
 
@@ -90,8 +125,9 @@ aicode/
 ├── intelligent_agent.py # the agentic tool-call loop
 ├── tools_registry.py    # tool definitions + the `modifies_fs` flag
 ├── tools/               # read_file, execute_command, search_web, fetch_url, edit_file
+├── mcp_config.py        # `~/.brodex/mcp.json` reader/writer for `/mcp`
 └── providers/
-    └── groq_provider.py # Groq client + token-usage tracking
+    └── groq_provider.py # Groq client, token-usage tracking, history compaction
 ```
 
 ## Development
